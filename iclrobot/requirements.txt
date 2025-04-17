@@ -15,6 +15,7 @@ mediapy
 optax
 scipy
 xax
+ksim
 
 # Mujoco
 mujoco
