@@ -10,7 +10,10 @@ import ksim
 import xax
 from jaxtyping import Array, PRNGKeyArray
 
-from iclrobot.dh_walking.dh_walking import NUM_INPUTS, NUM_JOINTS, HumanoidWalkingTask, HumanoidWalkingTaskConfig
+from iclrobot.dh_walking.dh_walking import NUM_JOINTS, HumanoidWalkingTask, HumanoidWalkingTaskConfig
+
+
+NUM_INPUTS = 2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3
 
 
 class DefaultHumanoidActor(eqx.Module):

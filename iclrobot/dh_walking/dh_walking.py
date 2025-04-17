@@ -16,7 +16,6 @@ from kscale.web.gen.api import JointMetadataOutput
 from mujoco import mjx
 
 NUM_JOINTS = 21
-NUM_INPUTS = 2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3
 
 
 @attrs.define(frozen=True, kw_only=True)
