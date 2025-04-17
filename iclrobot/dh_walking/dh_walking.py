@@ -6,39 +6,54 @@ from pathlib import Path
 from typing import Generic, TypeVar
 
 import attrs
+import glm
+import jax
 import jax.numpy as jnp
+import numpy as np
 import ksim
 import mujoco
 import optax
+from ksim.types import PhysicsModel
+from ksim.utils.reference_motion import (
+    ReferenceMapping,
+    generate_reference_motion,
+    get_reference_joint_id,
+    visualize_reference_motion,
+    visualize_reference_points,
+)
 import xax
 from jaxtyping import Array
 from kscale.web.gen.api import JointMetadataOutput
 from mujoco import mjx
 
+
+try:
+    import bvhio
+    from bvhio.lib.hierarchy import Joint as BvhioJoint
+except ImportError as e:
+    raise ImportError(
+        "In order to use reference motion utilities, please install Bvhio, using 'pip install bvhio'."
+    ) from e
+
+from scipy.spatial.transform import Rotation as R
+
 NUM_JOINTS = 21
 
 
-@attrs.define(frozen=True, kw_only=True)
-class NaiveForwardReward(ksim.Reward):
-    """A simple reward function that rewards forward velocity up to a maximum value.
-
-    Attributes:
-        clip_max: Maximum value to clip the forward velocity reward to.
-    """
-
-    clip_max: float = attrs.field(default=5.0)
-
-    def __call__(self, trajectory: ksim.Trajectory, reward_carry: None) -> tuple[Array, None]:
-        """Compute the reward based on forward velocity.
-
-        Args:
-            trajectory: The trajectory to compute the reward for.
-            reward_carry: Unused carry state for the reward computation.
-
-        Returns:
-            A tuple containing the clipped forward velocity reward and None for the carry state.
-        """
-        return trajectory.qvel[..., 0].clip(max=self.clip_max), None
+HUMANOID_REFERENCE_MAPPINGS = (
+    ReferenceMapping("CC_Base_L_ThighTwist01", "thigh_left"),  # hip
+    ReferenceMapping("CC_Base_L_CalfTwist01", "shin_left"),  # knee
+    ReferenceMapping("CC_Base_L_Foot", "foot_left"),  # foot
+    ReferenceMapping("CC_Base_L_UpperarmTwist01", "upper_arm_left"),  # shoulder
+    ReferenceMapping("CC_Base_L_ForearmTwist01", "lower_arm_left"),  # elbow
+    ReferenceMapping("CC_Base_L_Hand", "hand_left"),  # hand
+    ReferenceMapping("CC_Base_R_ThighTwist01", "thigh_right"),  # hip
+    ReferenceMapping("CC_Base_R_CalfTwist01", "shin_right"),  # knee
+    ReferenceMapping("CC_Base_R_Foot", "foot_right"),  # foot
+    ReferenceMapping("CC_Base_R_UpperarmTwist01", "upper_arm_right"),  # shoulder
+    ReferenceMapping("CC_Base_R_ForearmTwist01", "lower_arm_right"),  # elbow
+    ReferenceMapping("CC_Base_R_Hand", "hand_right"),  # hand
+)
 
 
 @dataclass
@@ -101,6 +116,50 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="The minimum number of steps to wait before changing the curriculum level.",
     )
 
+    # Reference motion parameters.
+    bvh_path: str = xax.field(
+        value=str(Path(__file__).parent / "data" / "walk_normal_dh.bvh"),
+        help="The path to the BVH file.",
+    )
+    rotate_bvh_euler: tuple[float, float, float] = xax.field(
+        value=(0, 0, 0),
+        help="Optional rotation to ensure the BVH tree matches the Mujoco model.",
+    )
+    bvh_scaling_factor: float = xax.field(
+        value=1.0,
+        help="Scaling factor to ensure the BVH tree matches the Mujoco model.",
+    )
+    bvh_offset: tuple[float, float, float] = xax.field(
+        value=(0.0, 0.0, 0.0),
+        help="Offset to ensure the BVH tree matches the Mujoco model.",
+    )
+    mj_base_name: str = xax.field(
+        value="pelvis",
+        help="The Mujoco body name of the base of the humanoid",
+    )
+    reference_base_name: str = xax.field(
+        value="CC_Base_Pelvis",
+        help="The BVH joint name of the base of the humanoid",
+    )
+    visualize_reference_points: bool = xax.field(
+        value=False,
+        help="Whether to visualize the reference points.",
+    )
+    visualize_reference_motion: bool = xax.field(
+        value=False,
+        help="Whether to visualize the reference motion after running IK.",
+    )
+
+    # Engine parameters.
+    min_action_latency: float = xax.field(
+        value=0.0,
+        help="The minimum latency of the action.",
+    )
+    max_action_latency: float = xax.field(
+        value=0.0,
+        help="The maximum latency of the action.",
+    )
+
     # Rendering parameters.
     render_track_body_id: int | None = xax.field(
         value=0,
@@ -113,8 +172,65 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="Whether to export the model for inference.",
     )
 
+    # Experimental parameters.
+    randomize_physics: bool = xax.field(
+        value=False,
+        help="Whether to randomize the physics during training.",
+    )
+
 
 Config = TypeVar("Config", bound=HumanoidWalkingTaskConfig)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class NaiveForwardReward(ksim.Reward):
+    """A simple reward function that rewards forward velocity up to a maximum value.
+
+    Attributes:
+        clip_max: Maximum value to clip the forward velocity reward to.
+    """
+
+    clip_max: float = attrs.field(default=5.0)
+
+    def __call__(self, trajectory: ksim.Trajectory, _: None) -> tuple[Array, None]:
+        """Compute the reward based on forward velocity.
+
+        Args:
+            trajectory: The trajectory to compute the reward for.
+
+        Returns:
+            A tuple containing the clipped forward velocity reward and None for the carry state.
+        """
+        return trajectory.qvel[..., 0].clip(max=self.clip_max), None
+
+
+@attrs.define(frozen=True, kw_only=True)
+class QposReferenceMotionReward(ksim.Reward):
+    reference_qpos: xax.HashableArray
+    ctrl_dt: float
+    norm: xax.NormType = attrs.field(default="l1")
+    sensitivity: float = attrs.field(default=5.0)
+
+    @property
+    def num_frames(self) -> int:
+        return self.reference_qpos.array.shape[0]
+
+    def __call__(self, trajectory: ksim.Trajectory, _: None) -> tuple[Array, None]:
+        """Compute the reward based on the reference motion.
+
+        Args:
+            trajectory: The trajectory to compute the reward for.
+
+        Returns:
+            A tuple containing the reward and None for the carry state.
+        """
+        qpos = trajectory.qpos
+        step_number = jnp.int32(jnp.round(trajectory.timestep / self.ctrl_dt)) % self.num_frames
+        reference_qpos = jnp.take(self.reference_qpos.array, step_number, axis=0)
+        error = xax.get_norm(reference_qpos - qpos, self.norm)
+        mean_error = error.mean(axis=-1)
+        reward = jnp.exp(-mean_error * self.sensitivity)
+        return reward, None
 
 
 class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
@@ -123,6 +239,8 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
     This class implements a PPO-based training task for teaching a humanoid robot to walk.
     It includes reward shaping, curriculum learning, and various safety checks.
     """
+
+    reference_motion: ksim.ReferenceMotionData
 
     def get_optimizer(self) -> optax.GradientTransformation:
         """Builds the optimizer for training."""
@@ -172,13 +290,18 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
 
     def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
         """Gets randomizers for domain randomization during training."""
-        return [
-            ksim.StaticFrictionRandomizer(),
-            ksim.ArmatureRandomizer(),
-            ksim.MassMultiplicationRandomizer.from_body_name(physics_model, "torso"),
-            ksim.JointDampingRandomizer(),
-            ksim.JointZeroPositionRandomizer(),
-        ]
+        if self.config.randomize_physics:
+            return [
+                ksim.StaticFrictionRandomizer(scale_lower=0.2, scale_upper=4.0),
+                ksim.ArmatureRandomizer(scale_lower=0.85, scale_upper=1.15),
+                ksim.MassMultiplicationRandomizer.from_body_name(
+                    physics_model, "torso", scale_lower=0.85, scale_upper=1.15
+                ),
+                ksim.JointDampingRandomizer(scale_lower=0.85, scale_upper=1.15),
+                ksim.JointZeroPositionRandomizer(scale_lower=-0.15, scale_upper=0.15),
+            ]
+        else:
+            return []
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         """Gets events that can occur during training."""
@@ -246,6 +369,9 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
         return [
             ksim.StayAliveReward(scale=1.0),
             NaiveForwardReward(scale=0.1, clip_max=self.config.linear_velocity_clip_max),
+            QposReferenceMotionReward(
+                reference_qpos=self.reference_motion.qpos, ctrl_dt=self.config.ctrl_dt, scale=0.5
+            ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -266,3 +392,53 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
             min_level_steps=self.config.min_level_steps,
             dt=self.config.ctrl_dt,
         )
+
+    def run(self) -> None:
+        mj_model: PhysicsModel = self.get_mujoco_model()
+        root: BvhioJoint = bvhio.readAsHierarchy(self.config.bvh_path)
+        reference_base_id = get_reference_joint_id(root, self.config.reference_base_name)
+        self.mj_base_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, self.config.mj_base_name)
+
+        def rotation_callback(root: BvhioJoint) -> None:
+            euler_rotation = np.array(self.config.rotate_bvh_euler)
+            quat = R.from_euler("xyz", euler_rotation).as_quat(scalar_first=True)
+            root.applyRotation(glm.quat(*quat), bake=True)
+
+        reference_motion = generate_reference_motion(
+            model=mj_model,
+            mj_base_id=self.mj_base_id,
+            bvh_root=root,
+            bvh_to_mujoco_names=HUMANOID_REFERENCE_MAPPINGS,
+            bvh_base_id=reference_base_id,
+            bvh_offset=np.array(self.config.bvh_offset),
+            bvh_root_callback=rotation_callback,
+            bvh_scaling_factor=self.config.bvh_scaling_factor,
+            ctrl_dt=self.config.ctrl_dt,
+            neutral_qpos=None,
+            neutral_similarity_weight=0.1,
+            temporal_consistency_weight=0.1,
+            n_restarts=3,
+            error_acceptance_threshold=1e-4,
+            ftol=1e-8,
+            xtol=1e-8,
+            max_nfev=2000,
+            verbose=False,
+        )
+        self.reference_motion = reference_motion
+        np_cartesian_motion = jax.tree.map(np.asarray, self.reference_motion.cartesian_poses)
+
+        if self.config.visualize_reference_points:
+            visualize_reference_points(
+                model=mj_model,
+                base_id=self.mj_base_id,
+                reference_motion=np_cartesian_motion,
+            )
+        elif self.config.visualize_reference_motion:
+            visualize_reference_motion(
+                model=mj_model,
+                reference_qpos=np.asarray(self.reference_motion.qpos),
+                cartesian_motion=np_cartesian_motion,
+                mj_base_id=self.mj_base_id,
+            )
+        else:
+            super().run()

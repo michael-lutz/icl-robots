@@ -13,9 +13,6 @@ from jaxtyping import Array, PRNGKeyArray
 from iclrobot.dh_walking.dh_walking import NUM_JOINTS, HumanoidWalkingTask, HumanoidWalkingTaskConfig
 
 
-NUM_INPUTS = 2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3
-
-
 class DefaultHumanoidActor(eqx.Module):
     """Actor network for the walking task that outputs a mixture of Gaussians policy.
 
@@ -36,7 +33,7 @@ class DefaultHumanoidActor(eqx.Module):
     def __init__(
         self,
         key: PRNGKeyArray,
-        *,
+        num_inputs: int,
         min_std: float,
         max_std: float,
         var_scale: float,
@@ -55,7 +52,6 @@ class DefaultHumanoidActor(eqx.Module):
             depth: Number of hidden layers.
             num_mixtures: Number of Gaussian components in the mixture.
         """
-        num_inputs = NUM_INPUTS
         num_outputs = NUM_JOINTS
 
         self.mlp = eqx.nn.MLP(
@@ -112,7 +108,7 @@ class DefaultHumanoidCritic(eqx.Module):
     def __init__(
         self,
         key: PRNGKeyArray,
-        *,
+        num_inputs: int,
         hidden_size: int,
         depth: int,
     ) -> None:
@@ -123,7 +119,6 @@ class DefaultHumanoidCritic(eqx.Module):
             hidden_size: Number of hidden units in each layer.
             depth: Number of hidden layers.
         """
-        num_inputs = NUM_INPUTS
         num_outputs = 1
 
         self.mlp = eqx.nn.MLP(
@@ -161,7 +156,8 @@ class DefaultHumanoidModel(eqx.Module):
     def __init__(
         self,
         key: PRNGKeyArray,
-        *,
+        actor_num_inputs: int,
+        critic_num_inputs: int,
         hidden_size: int,
         depth: int,
         num_mixtures: int,
@@ -176,6 +172,7 @@ class DefaultHumanoidModel(eqx.Module):
         """
         self.actor = DefaultHumanoidActor(
             key,
+            num_inputs=actor_num_inputs,
             min_std=0.01,
             max_std=1.0,
             var_scale=0.5,
@@ -185,6 +182,7 @@ class DefaultHumanoidModel(eqx.Module):
         )
         self.critic = DefaultHumanoidCritic(
             key,
+            num_inputs=critic_num_inputs,
             hidden_size=hidden_size,
             depth=depth,
         )
@@ -218,6 +216,8 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         """Creates the actor-critic model."""
         return DefaultHumanoidModel(
             key,
+            actor_num_inputs=2 + NUM_JOINTS + NUM_JOINTS + 3 + 4,
+            critic_num_inputs=2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3,
             hidden_size=self.config.hidden_size,
             depth=self.config.depth,
             num_mixtures=self.config.num_mixtures,
@@ -246,15 +246,8 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         timestep_1 = observations["timestep_observation"]
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
-        com_inertia_n = observations["center_of_mass_inertia_observation"]
-        com_vel_n = observations["center_of_mass_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
-        imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        act_frc_obs_n = observations["actuator_force_observation"]
-        base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
-        lin_vel_obs_3 = observations["base_linear_velocity_observation"]
-        ang_vel_obs_3 = observations["base_angular_velocity_observation"]
 
         obs_n = jnp.concatenate(
             [
@@ -262,15 +255,8 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
                 jnp.sin(timestep_1),  # 1
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
-                com_inertia_n,  # 160
-                com_vel_n,  # 96
                 imu_acc_3 / 50.0,  # 3
-                imu_gyro_3 / 3.0,  # 3
-                act_frc_obs_n / 100.0,  # NUM_JOINTS
-                base_pos_3,  # 3
                 base_quat_4,  # 4
-                lin_vel_obs_3,  # 3
-                ang_vel_obs_3,  # 3
             ],
             axis=-1,
         )
@@ -418,12 +404,10 @@ if __name__ == "__main__":
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=10.0,
-            # Logging parameters.
-            # log_full_trajectory_every_n_seconds=60,
-            # Simulation parameters.
             dt=0.005,
             ctrl_dt=0.02,
             max_action_latency=0.0,
             min_action_latency=0.0,
+            randomize_physics=False,
         ),
     )
