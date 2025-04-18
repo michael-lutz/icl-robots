@@ -2,7 +2,7 @@
 """Defines simple task for training a walking policy for the default humanoid using an SSM actor."""
 
 from dataclasses import dataclass
-from typing import Generic, Literal, TypeVar
+from typing import Generic, Literal, TypeVar, cast, get_args
 
 from abc import ABC, abstractmethod
 import distrax
@@ -14,12 +14,10 @@ from jaxtyping import Array, PRNGKeyArray
 
 import ksim
 
-from .walking import (
-    NUM_INPUTS,
+from iclrobot.dh_walking.dh_walking import (
     NUM_JOINTS,
     HumanoidWalkingTask,
     HumanoidWalkingTaskConfig,
-    NaiveForwardReward,
 )
 
 
@@ -39,9 +37,6 @@ def glorot(key: PRNGKeyArray, shape: tuple[int, ...]) -> Array:
 class BaseSSMBlock(eqx.Module, ABC):
     @abstractmethod
     def forward(self, h: Array, x: Array) -> Array: ...
-
-    @abstractmethod
-    def forward_sequence(self, x_seq: Array, reset: Array) -> Array: ...
 
     @abstractmethod
     def get_a_mat(self, x: Array) -> Array: ...
@@ -66,6 +61,7 @@ class SSMBlock(BaseSSMBlock):
         return self.b_mat
 
     def forward(self, h: Array, x: Array) -> Array:
+        """Performs a single forward pass."""
         a_mat = self.get_a_mat(x)
         b_mat = self.get_b_mat(x)
         h = a_mat @ h + b_mat.T @ x
@@ -126,6 +122,41 @@ class DiscreteDiagSSMBlock(DiagSSMBlock):
         return b_discrete
 
 
+class DPLRSSMBlock(BaseSSMBlock):
+    a_diag: Array
+    p_vec: Array
+    q_vec: Array
+    b_mat: Array
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        key: PRNGKeyArray,
+        rank: int = 4,
+    ) -> None:
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.a_diag = glorot(k1, (hidden_size,))
+        self.p_vec = glorot(k2, (hidden_size, rank))
+        self.q_vec = glorot(k3, (hidden_size, rank))
+        self.b_mat = glorot(k4, (hidden_size, hidden_size))
+
+    def get_a_mat(self, x: Array) -> Array:
+        """Construct discretized A matrix: diag(a_diag) + P Q^T, exponentiated."""
+        a_mat = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
+        return a_mat
+
+    def get_b_mat(self, x: Array) -> Array:
+        """Discretize B using: ∫ exp(A τ) dτ B ≈ A^{-1}(exp(A Δ) - I) B"""
+        return self.b_mat
+
+    def forward(self, h: Array, x: Array) -> Array:
+        """Performs a single forward pass."""
+        A = self.get_a_mat(x)
+        B = self.get_b_mat(x)
+        return A @ h + B @ x
+
+
 class SSM(eqx.Module):
     input_proj: eqx.nn.Linear
     output_proj: eqx.nn.Linear
@@ -140,7 +171,7 @@ class SSM(eqx.Module):
         output_size: int,
         hidden_size: int,
         num_layers: int,
-        block_type: Literal["diagonal", "full_rank"] = "diagonal",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
         skip_connections: bool = False,
         discretize: bool = False,
         *,
@@ -152,7 +183,6 @@ class SSM(eqx.Module):
         block_keys = jax.random.split(block_key, num_layers)
 
         def get_block(key: PRNGKeyArray) -> BaseSSMBlock:
-            """Returns a block of the given type."""
             match block_type:
                 case "diagonal":
                     return (
@@ -164,6 +194,8 @@ class SSM(eqx.Module):
                     if discretize:
                         raise ValueError("Full rank blocks do not support discretization due to instability.")
                     return SSMBlock(hidden_size, key=key)
+                case "dplr":
+                    return DPLRSSMBlock(hidden_size, key=key)
                 case _:
                     raise ValueError(f"Unknown block type: {block_type}")
 
@@ -195,6 +227,7 @@ class DefaultHumanoidSSMActor(eqx.Module):
     min_std: float = eqx.static_field()
     max_std: float = eqx.static_field()
     var_scale: float = eqx.static_field()
+    num_mixtures: int = eqx.static_field()
 
     def __init__(
         self,
@@ -207,13 +240,13 @@ class DefaultHumanoidSSMActor(eqx.Module):
         var_scale: float,
         hidden_size: int,
         depth: int,
-        block_type: Literal["diagonal", "full_rank"] = "diagonal",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
         discretize: bool = False,
+        num_mixtures: int = 5,
     ) -> None:
-        # Project input to hidden size
         self.ssm = SSM(
             input_size=num_inputs,
-            output_size=num_outputs * 2,
+            output_size=num_outputs * 3 * num_mixtures,
             hidden_size=hidden_size,
             num_layers=depth,
             block_type=block_type,
@@ -226,17 +259,26 @@ class DefaultHumanoidSSMActor(eqx.Module):
         self.min_std = min_std
         self.max_std = max_std
         self.var_scale = var_scale
+        self.num_mixtures = num_mixtures
 
-    def forward(self, x: Array, carry: Array) -> tuple[distrax.Distribution, Array]:
-        new_hs, out_n = self.ssm(carry, x)
-        # Converts the output to a distribution.
-        mean_n = out_n[..., : self.num_outputs]
-        std_n = out_n[..., self.num_outputs :]
+    def forward(self, obs_n: Array, carry: Array) -> tuple[distrax.Distribution, Array]:
+        new_hs, out_n = self.ssm(carry, obs_n)
+
+        # Splits the predictions into means, standard deviations, and logits.
+        slice_len = NUM_JOINTS * self.num_mixtures
+        mean_nm = out_n[:slice_len].reshape(NUM_JOINTS, self.num_mixtures)
+        std_nm = out_n[slice_len : slice_len * 2].reshape(NUM_JOINTS, self.num_mixtures)
+        logits_nm = out_n[slice_len * 2 :].reshape(NUM_JOINTS, self.num_mixtures)
 
         # Softplus and clip to ensure positive standard deviations.
-        std_n = jnp.clip((jax.nn.softplus(std_n) + self.min_std) * self.var_scale, max=self.max_std)
+        std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale, max=self.max_std)
 
-        dist_n = distrax.Normal(mean_n, std_n)
+        # Using mixture of gaussians to encourage exploration at the start.
+        dist_n = distrax.MixtureSameFamily(
+            mixture_distribution=distrax.Categorical(logits=logits_nm),
+            components_distribution=distrax.Normal(mean_nm, std_nm),
+        )
+
         return dist_n, new_hs
 
 
@@ -252,7 +294,7 @@ class DefaultHumanoidSSMCritic(eqx.Module):
         num_inputs: int,
         hidden_size: int,
         depth: int,
-        block_type: Literal["diagonal", "full_rank"] = "diagonal",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
         discretize: bool = False,
     ) -> None:
         num_outputs = 1
@@ -268,8 +310,8 @@ class DefaultHumanoidSSMCritic(eqx.Module):
             key=key,
         )
 
-    def forward(self, x: Array, carry: Array) -> tuple[Array, Array]:
-        new_hs, out_n = self.ssm(carry, x)
+    def forward(self, obs_n: Array, carry: Array) -> tuple[Array, Array]:
+        new_hs, out_n = self.ssm(carry, obs_n)
         return out_n, new_hs
 
 
@@ -280,19 +322,20 @@ class DefaultHumanoidSSMModel(eqx.Module):
     def __init__(
         self,
         key: PRNGKeyArray,
-        *,
         min_std: float,
         max_std: float,
-        num_inputs: int,
+        num_actor_inputs: int,
+        num_critic_inputs: int,
         num_joints: int,
         hidden_size: int,
         depth: int,
-        block_type: Literal["diagonal", "full_rank"] = "diagonal",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
         discretize: bool = False,
+        num_mixtures: int = 5,
     ) -> None:
         self.actor = DefaultHumanoidSSMActor(
             key,
-            num_inputs=num_inputs,
+            num_inputs=num_actor_inputs,
             num_outputs=num_joints,
             min_std=min_std,
             max_std=max_std,
@@ -301,10 +344,11 @@ class DefaultHumanoidSSMModel(eqx.Module):
             depth=depth,
             block_type=block_type,
             discretize=discretize,
+            num_mixtures=num_mixtures,
         )
         self.critic = DefaultHumanoidSSMCritic(
             key,
-            num_inputs=num_inputs,
+            num_inputs=num_critic_inputs,
             hidden_size=hidden_size,
             depth=depth,
             block_type=block_type,
@@ -314,13 +358,25 @@ class DefaultHumanoidSSMModel(eqx.Module):
 
 @dataclass
 class HumanoidWalkingSSMTaskConfig(HumanoidWalkingTaskConfig):
-    block_type: Literal["diagonal", "full_rank"] = xax.field(
-        value="diagonal",
+    block_type: str = xax.field(
+        value="dplr",
         help="The type of SSM block to use.",
     )
     discretize: bool = xax.field(
         value=False,
         help="Whether to discretize the SSM blocks.",
+    )
+    hidden_size: int = xax.field(
+        value=128,
+        help="The hidden size for the SSM.",
+    )
+    depth: int = xax.field(
+        value=5,
+        help="The number of SSM layers.",
+    )
+    num_mixtures: int = xax.field(
+        value=5,
+        help="The number of mixtures for the actor.",
     )
 
 
@@ -328,17 +384,75 @@ Config = TypeVar("Config", bound=HumanoidWalkingSSMTaskConfig)
 
 
 class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
+    """SSM-based task for the walking task."""
+
+    @property
+    def actor_num_inputs(self) -> int:
+        """The number of inputs to the actor network.
+
+        The inputs are:
+        - 2 (timestep sin/cos)
+        - NUM_JOINTS (positions)
+        - NUM_JOINTS (velocities)
+        - 3 (imu_acc)
+        - 4 (base_quat)
+        - NUM_JOINTS * history_length (action history)
+        """
+        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 4
+
+    @property
+    def critic_num_inputs(self) -> int:
+        """The number of inputs to the critic network.
+
+        The inputs are:
+        - 2 (timestep sin/cos)
+        - NUM_JOINTS (positions)
+        - NUM_JOINTS (velocities)
+        - 160 (com_inertia)
+        - 96 (com_vel)
+        - 3 (imu_acc)
+        - 3 (imu_gyro)
+        - NUM_JOINTS (actuator_force)
+        - 3 (base_pos)
+        - 4 (base_quat)
+        - 3 (lin_vel_obs)
+        - 3 (ang_vel_obs)
+        """
+        return 2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3
+
     def get_model(self, key: PRNGKeyArray) -> DefaultHumanoidSSMModel:
+        valid_types = get_args(Literal["diagonal", "full_rank", "dplr"])
+        if self.config.block_type not in valid_types:
+            raise ValueError(f"Invalid block_type: {self.config.block_type}. Must be one of {valid_types}")
+
+        block_type = cast(Literal["diagonal", "full_rank", "dplr"], self.config.block_type)
+
         return DefaultHumanoidSSMModel(
             key,
-            num_inputs=NUM_INPUTS,
+            num_actor_inputs=self.actor_num_inputs,
+            num_critic_inputs=self.critic_num_inputs,
             num_joints=NUM_JOINTS,
             min_std=0.01,
             max_std=1.0,
+            num_mixtures=self.config.num_mixtures,
             hidden_size=self.config.hidden_size,
             depth=self.config.depth,
-            block_type=self.config.block_type,
+            block_type=block_type,
             discretize=self.config.discretize,
+        )
+
+    def get_initial_model_carry(self, rng: PRNGKeyArray) -> tuple[Array, Array]:
+        """Gets initial carry state for the model.
+
+        Args:
+            rng: Random number generator key.
+
+        Returns:
+            Initial RNN hidden states for actor and critic.
+        """
+        return (
+            jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
+            jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
         )
 
     def run_actor(
@@ -348,20 +462,22 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[distrax.Distribution, Array]:
+        """Runs the actor network to get an action distribution.
+
+        Args:
+            model: The actor network.
+            observations: Current observations.
+            commands: Current commands.
+            carry: RNN hidden state.
+
+        Returns:
+            A tuple of action distribution and next RNN hidden state.
+        """
         timestep_1 = observations["timestep_observation"]
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
-        com_inertia_n = observations["center_of_mass_inertia_observation"]
-        com_vel_n = observations["center_of_mass_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
-        imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        act_frc_obs_n = observations["actuator_force_observation"]
-        base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
-        lin_vel_obs_3 = observations["base_linear_velocity_observation"]
-        ang_vel_obs_3 = observations["base_angular_velocity_observation"]
-        joystick_cmd_1 = commands["joystick_command"]
-        joystick_cmd_ohe_6 = jax.nn.one_hot(joystick_cmd_1, num_classes=6).squeeze(-2)
 
         obs_n = jnp.concatenate(
             [
@@ -369,16 +485,8 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
                 jnp.sin(timestep_1),  # 1
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
-                com_inertia_n,  # 160
-                com_vel_n,  # 96
                 imu_acc_3 / 50.0,  # 3
-                imu_gyro_3 / 3.0,  # 3
-                act_frc_obs_n / 100.0,  # NUM_JOINTS
-                base_pos_3,  # 3
                 base_quat_4,  # 4
-                lin_vel_obs_3,  # 3
-                ang_vel_obs_3,  # 3
-                joystick_cmd_ohe_6,  # 6
             ],
             axis=-1,
         )
@@ -392,6 +500,17 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[Array, Array]:
+        """Runs the critic network to get state values.
+
+        Args:
+            model: The critic network.
+            observations: Current observations.
+            commands: Current commands.
+            carry: RNN hidden state.
+
+        Returns:
+            A tuple of state values and next RNN hidden state.
+        """
         timestep_1 = observations["timestep_observation"]
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
@@ -399,13 +518,11 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         com_vel_n = observations["center_of_mass_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        act_frc_obs_n = observations["actuator_force_observation"]
+        act_frc_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
         lin_vel_obs_3 = observations["base_linear_velocity_observation"]
         ang_vel_obs_3 = observations["base_angular_velocity_observation"]
-        joystick_cmd_1 = commands["joystick_command"]
-        joystick_cmd_ohe_6 = jax.nn.one_hot(joystick_cmd_1, num_classes=6).squeeze(-2)
 
         obs_n = jnp.concatenate(
             [
@@ -417,12 +534,11 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
                 com_vel_n,  # 96
                 imu_acc_3 / 50.0,  # 3
                 imu_gyro_3 / 3.0,  # 3
-                act_frc_obs_n / 100.0,  # NUM_JOINTS
+                act_frc_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
                 lin_vel_obs_3,  # 3
                 ang_vel_obs_3,  # 3
-                joystick_cmd_ohe_6,  # 6
             ],
             axis=-1,
         )
@@ -436,6 +552,18 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         model_carry: tuple[Array, Array],
         rng: PRNGKeyArray,
     ) -> tuple[ksim.PPOVariables, tuple[Array, Array]]:
+        """Computes PPO variables for training.
+
+        Args:
+            model: The actor-critic model.
+            trajectory: The trajectory to compute variables for.
+            model_carry: Model carry state containing RNN hidden states.
+            rng: Random number generator key.
+
+        Returns:
+            A tuple of PPO variables and the next model carry state.
+        """
+
         def scan_fn(
             actor_critic_carry: tuple[Array, Array], transition: ksim.Trajectory
         ) -> tuple[tuple[Array, Array], ksim.PPOVariables]:
@@ -471,12 +599,6 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
 
         return ppo_variables, next_model_carry
 
-    def get_initial_model_carry(self, rng: PRNGKeyArray) -> tuple[Array, Array]:
-        return (
-            jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
-            jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
-        )
-
     def sample_action(
         self,
         model: DefaultHumanoidSSMModel,
@@ -488,6 +610,21 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         rng: PRNGKeyArray,
         argmax: bool,
     ) -> ksim.Action:
+        """Samples an action from the policy.
+
+        Args:
+            model: The actor-critic model.
+            model_carry: RNN hidden states.
+            physics_model: The physics model.
+            physics_state: The current physics state.
+            observations: Current observations.
+            commands: Current commands.
+            rng: Random number generator key.
+            argmax: Whether to take the mode of the distribution instead of sampling.
+
+        Returns:
+            A sampled action with its carry state and auxiliary outputs.
+        """
         actor_carry_in, critic_carry_in = model_carry
 
         # Runs the actor model to get the action distribution.
@@ -509,15 +646,15 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
 
 if __name__ == "__main__":
     # To run training, use the following command:
-    #   python -m examples.walking_SSM
+    #   python -m iclrobot.dh_walking.dh_walking_ssm
     # To visualize the environment, use the following command:
-    #   python -m examples.walking_SSM run_environment=True
+    #   python -m iclrobot.dh_walking.dh_walking_ssm run_environment=True
+    # On MacOS or other devices with less memory, you can change the number
+    # of environments and batch size to reduce memory usage. Here's an example
+    # from the command line:
+    #   python -m iclrobot.dh_walking.dh_walking_ssm num_envs=8 rollouts_per_batch=4
     HumanoidWalkingSSMTask.launch(
         HumanoidWalkingSSMTaskConfig(
-            block_type="full_rank",
-            discretize=True,
-            hidden_size=512,
-            depth=2,
             # Training parameters.
             num_envs=2048,
             batch_size=256,
@@ -529,5 +666,6 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             max_action_latency=0.0,
             min_action_latency=0.0,
+            randomize_physics=False,
         ),
     )
