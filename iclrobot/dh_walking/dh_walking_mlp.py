@@ -439,10 +439,11 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         )
         action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
         action_history = jnp.concatenate([model_carry.action_history[1:], action_j[None]], axis=0)
+        next_model_carry = HumanoidWalkingMLPModelCarry(action_history)
         return ksim.Action(
             action=action_j,
-            carry=HumanoidWalkingMLPModelCarry(action_history),
-            aux_outputs=HumanoidWalkingMLPModelCarry(action_history),
+            carry=next_model_carry,
+            aux_outputs=next_model_carry,  # will be cached in trajectory
         )
 
 
@@ -463,6 +464,7 @@ if __name__ == "__main__":
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=10.0,
+            # Simulation parameters.
             dt=0.005,
             ctrl_dt=0.02,
             max_action_latency=0.0,

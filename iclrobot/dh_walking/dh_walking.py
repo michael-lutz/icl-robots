@@ -16,6 +16,7 @@ import optax
 from ksim.types import PhysicsModel
 from ksim.utils.reference_motion import (
     ReferenceMapping,
+    ReferenceMotionData,
     generate_reference_motion,
     get_reference_joint_id,
     visualize_reference_motion,
@@ -240,7 +241,7 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
     It includes reward shaping, curriculum learning, and various safety checks.
     """
 
-    reference_motion: ksim.ReferenceMotionData
+    reference_motion: ReferenceMotionData
 
     def get_optimizer(self) -> optax.GradientTransformation:
         """Builds the optimizer for training."""
@@ -305,17 +306,8 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         """Gets events that can occur during training."""
-        return [
-            ksim.PushEvent(
-                x_force=1.0,
-                y_force=1.0,
-                z_force=0.0,
-                x_angular_force=0.1,
-                y_angular_force=0.1,
-                z_angular_force=0.3,
-                interval_range=(0.25, 0.75),
-            ),
-        ]
+        # TODO: add better events here...
+        return []
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         """Gets reset operations for episode initialization."""
@@ -336,27 +328,8 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
             ksim.BaseOrientationObservation(),
             ksim.BaseLinearVelocityObservation(),
             ksim.BaseAngularVelocityObservation(),
-            ksim.BaseLinearAccelerationObservation(),
-            ksim.BaseAngularAccelerationObservation(),
-            ksim.ActuatorAccelerationObservation(),
             ksim.SensorObservation.create(physics_model=physics_model, sensor_name="imu_acc"),
             ksim.SensorObservation.create(physics_model=physics_model, sensor_name="imu_gyro"),
-            ksim.FeetContactObservation.create(
-                physics_model=physics_model,
-                foot_left_geom_names=["foot1_left", "foot2_left"],
-                foot_right_geom_names=["foot1_right", "foot2_right"],
-                floor_geom_names=["floor"],
-            ),
-            ksim.FeetPositionObservation.create(
-                physics_model=physics_model,
-                foot_left_body_name="foot_left",
-                foot_right_body_name="foot_right",
-            ),
-            ksim.FeetOrientationObservation.create(
-                physics_model=physics_model,
-                foot_left_body_name="foot_left",
-                foot_right_body_name="foot_right",
-            ),
             ksim.TimestepObservation(),
         ]
 
