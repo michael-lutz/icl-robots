@@ -342,9 +342,9 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
         return [
             ksim.StayAliveReward(scale=1.0),
             NaiveForwardReward(scale=0.1, clip_max=self.config.linear_velocity_clip_max),
-            QposReferenceMotionReward(
-                reference_qpos=self.reference_motion.qpos, ctrl_dt=self.config.ctrl_dt, scale=0.5
-            ),
+            # QposReferenceMotionReward(
+            #     reference_qpos=self.reference_motion.qpos, ctrl_dt=self.config.ctrl_dt, scale=0.5
+            # ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:

@@ -21,15 +21,6 @@ from iclrobot.dh_walking.dh_walking import (
 )
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class AuxOutputs:
-    log_probs: Array
-    values: Array
-    actor_carry: Array
-    critic_carry: Array
-
-
 def glorot(key: PRNGKeyArray, shape: tuple[int, ...]) -> Array:
     return jax.random.uniform(key, shape, minval=-1.0, maxval=1.0) * jnp.sqrt(2 / sum(shape))
 
@@ -171,7 +162,7 @@ class SSM(eqx.Module):
         output_size: int,
         hidden_size: int,
         num_layers: int,
-        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "full_rank",
         skip_connections: bool = False,
         discretize: bool = False,
         *,
