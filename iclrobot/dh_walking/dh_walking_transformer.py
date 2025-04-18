@@ -108,6 +108,7 @@ class Transformer(eqx.Module):
         num_layers: int,
         num_heads: int,
         context_length: int,
+        cls_init_scale: float,
         key: PRNGKeyArray,
     ):
         self.hidden_size = hidden_size
@@ -115,7 +116,7 @@ class Transformer(eqx.Module):
         cls_key, learned_pos_key, block_key = jax.random.split(key, 3)
         block_keys = jax.random.split(block_key, num_layers)
 
-        self.cls_embedding = jnp.zeros((1, hidden_size))
+        self.cls_embedding = jax.random.uniform(cls_key, (1, hidden_size)) * cls_init_scale
         self.learned_position_embedding = eqx.nn.Embedding(context_length + 1, hidden_size, key=learned_pos_key)
         self.blocks = [AttentionBlock(hidden_size, num_heads, key=block_keys[i]) for i in range(num_layers)]
         self.final_ln = eqx.nn.LayerNorm(hidden_size)
@@ -128,9 +129,9 @@ class Transformer(eqx.Module):
     def forward_sequence(self, x_seq: Array) -> Array:
         chex.assert_shape(x_seq, (self.context_length, self.hidden_size))  # [T, D]
 
-        # Concatenate normalized cls_token to normalized sequence
-        x_seq = jnp.concatenate([x_seq, self.cls_embedding], axis=0)
+        # Concatenate cls_token to normalized sequence
         x_seq = jax.vmap(self.initial_ln)(x_seq)
+        x_seq = jnp.concatenate([x_seq, self.cls_embedding], axis=0)
         x_seq += self.input_pos_embedding(x_seq.shape[0], offset=0)
 
         for block in self.blocks:
@@ -168,6 +169,7 @@ class DefaultHumanoidTransformerActor(eqx.Module):
         num_heads: int,
         num_mixtures: int,
         num_frames: int,
+        cls_init_scale: float,
     ) -> None:
         """Initialize the actor network."""
         # Project input to hidden size
@@ -189,6 +191,7 @@ class DefaultHumanoidTransformerActor(eqx.Module):
             num_layers=depth,
             num_heads=num_heads,
             context_length=num_frames * 2,  # obs + act
+            cls_init_scale=cls_init_scale,
             key=transformer_key,
         )
 
@@ -267,6 +270,7 @@ class DefaultHumanoidTransformerCritic(eqx.Module):
         depth: int,
         num_heads: int,
         num_frames: int,
+        cls_init_scale: float,
     ):
         obs_key, act_key, out_key, transformer_key = jax.random.split(key, 4)
         self.obs_proj = eqx.nn.Linear(num_obs, hidden_size, key=obs_key)
@@ -276,6 +280,7 @@ class DefaultHumanoidTransformerCritic(eqx.Module):
             num_layers=depth,
             num_heads=num_heads,
             context_length=num_frames * 2,  # obs + act
+            cls_init_scale=cls_init_scale,
             key=transformer_key,
         )
         self.output_proj = eqx.nn.Linear(hidden_size, 1, key=out_key)
@@ -325,6 +330,7 @@ class DefaultHumanoidTransformerModel(eqx.Module):
         depth: int,
         num_heads: int,
         num_frames: int,
+        cls_init_scale: float,
     ) -> None:
         """Initialize the actor-critic model."""
         self.actor = DefaultHumanoidTransformerActor(
@@ -339,6 +345,7 @@ class DefaultHumanoidTransformerModel(eqx.Module):
             depth=depth,
             num_heads=num_heads,
             num_frames=num_frames,
+            cls_init_scale=cls_init_scale,
         )
         self.critic = DefaultHumanoidTransformerCritic(
             key,
@@ -348,6 +355,7 @@ class DefaultHumanoidTransformerModel(eqx.Module):
             depth=depth,
             num_heads=num_heads,
             num_frames=num_frames,
+            cls_init_scale=cls_init_scale,
         )
 
 
@@ -374,6 +382,10 @@ class HumanoidWalkingTransformerTaskConfig(HumanoidWalkingTaskConfig):
     num_mixtures: int = xax.field(
         value=5,
         help="The number of mixtures for the actor.",
+    )
+    cls_init_scale: float = xax.field(
+        value=0.01,
+        help="The initial scale for the CLS token.",
     )
 
 
@@ -431,6 +443,7 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
             depth=self.config.depth,
             num_heads=self.config.num_heads,
             num_frames=self.config.num_frames,
+            cls_init_scale=self.config.cls_init_scale,
         )
 
     def get_initial_model_carry(self, rng: PRNGKeyArray) -> HistoricalCarry:
