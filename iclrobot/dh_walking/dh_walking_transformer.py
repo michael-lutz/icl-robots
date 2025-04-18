@@ -20,11 +20,13 @@ from iclrobot.dh_walking.dh_walking import (
     HumanoidWalkingTaskConfig,
 )
 
+
 @jax.tree_util.register_dataclass
 @dataclass
 class HistoricalCarry:
     observations: xax.FrozenDict[str, Array]
     actions: Array
+
 
 class MultiHeadAttention(eqx.Module):
     dim: int = eqx.static_field()
@@ -38,25 +40,17 @@ class MultiHeadAttention(eqx.Module):
         self.head_dim = dim // num_heads
         self.w_qkv = eqx.nn.Linear(dim, dim * 3, key=key)
 
-    def apply_mask(self, attn_scores: Array, mask: Array) -> Array:
-        T_q, T_kv = mask.shape
-        chex.assert_shape(attn_scores, (..., T_q, T_kv))
-
-        return jax.tree.map(lambda x, m: jnp.where(m, -jnp.inf, x), attn_scores, mask)
-
-    def apply_attention(self, q: Array, k: Array, v: Array, mask: Array) -> Array:
+    def apply_attention(self, q: Array, k: Array, v: Array) -> Array:
         T_q, D = q.shape
         T_kv, D = k.shape
         chex.assert_shape(v, (T_kv, D))
-        chex.assert_shape(mask, (T_q, T_kv))
 
         q = q.reshape(T_q, self.num_heads, self.head_dim).transpose(1, 0, 2)  # [H, T_q, D_h]
         k = k.reshape(T_kv, self.num_heads, self.head_dim).transpose(1, 0, 2)  # [H, T_kv, D_h]
         v = v.reshape(T_kv, self.num_heads, self.head_dim).transpose(1, 0, 2)  # [H, T_kv, D_h]
 
         attn_scores = q @ k.transpose(0, 2, 1) / jnp.sqrt(self.head_dim)  # [H, T_q, T_kv]
-        attn_scores_masked = self.apply_mask(attn_scores, mask)
-        attn_weights = jax.nn.softmax(attn_scores_masked, axis=-1)
+        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
 
         res = attn_weights @ v  # [H, T_q, D_h]
         return res.transpose(1, 0, 2).reshape(T_q, D)  # [T_q, D]
@@ -67,7 +61,7 @@ class MultiHeadAttention(eqx.Module):
         q_seq, k_seq, v_seq = jnp.split(qkv_seq, 3, axis=-1)
 
         mask = jnp.zeros((T_seq, T_seq), dtype=jnp.bool_)  # [T_seq, T_seq]
-        attn_output = self.apply_attention(q_seq, k_seq, v_seq, mask)  # [T_seq, D]
+        attn_output = self.apply_attention(q_seq, k_seq, v_seq)  # [T_seq, D]
 
         res = x_seq + attn_output  # [T_seq, D]
         return res
@@ -87,7 +81,7 @@ class AttentionBlock(eqx.Module):
         self.ln1 = eqx.nn.LayerNorm(dim)
         self.ln2 = eqx.nn.LayerNorm(dim)
         self.attn = MultiHeadAttention(dim, num_heads, key=k1)
-        self.mlp = eqx.nn.MLP(dim, dim, width_size=4 * dim, depth=2, key=k2, activation=jax.nn.gelu)
+        self.mlp = eqx.nn.MLP(dim, dim, width_size=dim, depth=1, key=k2, activation=jax.nn.gelu)
 
     def forward_sequence(self, x_seq: Array) -> Array:
         x_norm1 = jax.vmap(self.ln1)(x_seq)
@@ -100,17 +94,16 @@ class AttentionBlock(eqx.Module):
 
 
 class Transformer(eqx.Module):
-    input_size: int = eqx.static_field()
     hidden_size: int = eqx.static_field()
-    cls_embedding: eqx.nn.Embedding
+    cls_embedding: Array
+    final_ln: eqx.nn.LayerNorm
+    initial_ln: eqx.nn.LayerNorm
     learned_position_embedding: eqx.nn.Embedding
     context_length: int = eqx.static_field()
-    output_layer: eqx.nn.Linear
     blocks: list[AttentionBlock]
 
     def __init__(
         self,
-        input_size: int,
         hidden_size: int,
         num_layers: int,
         num_heads: int,
@@ -119,29 +112,33 @@ class Transformer(eqx.Module):
     ):
         self.hidden_size = hidden_size
         self.context_length = context_length
-        keys = jax.random.split(key, num_layers + 2)
+        cls_key, learned_pos_key, block_key = jax.random.split(key, 3)
+        block_keys = jax.random.split(block_key, num_layers)
 
-        self.input_size = input_size
-        self.cls_embedding = eqx.nn.Embedding(input_size, hidden_size, key=keys[0])
-        self.learned_position_embedding = eqx.nn.Embedding(context_length, hidden_size, key=keys[1])
-        self.blocks = [AttentionBlock(hidden_size, num_heads, key=keys[i + 2]) for i in range(num_layers)]
-        self.output_layer = eqx.nn.Linear(hidden_size, input_size, key=keys[-1])
+        self.cls_embedding = jnp.zeros((1, hidden_size))
+        self.learned_position_embedding = eqx.nn.Embedding(context_length + 1, hidden_size, key=learned_pos_key)
+        self.blocks = [AttentionBlock(hidden_size, num_heads, key=block_keys[i]) for i in range(num_layers)]
+        self.final_ln = eqx.nn.LayerNorm(hidden_size)
+        self.initial_ln = eqx.nn.LayerNorm(hidden_size)
 
     def input_pos_embedding(self, seq_len: int, offset: int) -> Array:
         """Position embeddings added directly to the input sequence."""
         return jax.vmap(self.learned_position_embedding)(jnp.arange(offset, offset + seq_len))
 
     def forward_sequence(self, x_seq: Array) -> Array:
-        chex.assert_rank(x_seq, 1) # [T]
+        chex.assert_shape(x_seq, (self.context_length, self.hidden_size))  # [T, D]
 
-        cls_token = jnp.array([self.input_size])
-        x_seq = jnp.concatenate([x_seq, cls_token], axis=-1)
+        # Concatenate normalized cls_token to normalized sequence
+        x_seq = jnp.concatenate([x_seq, self.cls_embedding], axis=0)
+        x_seq = jax.vmap(self.initial_ln)(x_seq)
         x_seq += self.input_pos_embedding(x_seq.shape[0], offset=0)
 
         for block in self.blocks:
             x_seq = block.forward_sequence(x_seq)
 
+        x_seq = jax.vmap(self.final_ln)(x_seq)
         return x_seq
+
 
 class DefaultHumanoidTransformerActor(eqx.Module):
     """Transformer-based actor for the walking task."""
@@ -150,13 +147,13 @@ class DefaultHumanoidTransformerActor(eqx.Module):
     act_proj: eqx.nn.Linear
     transformer: Transformer
     output_proj: eqx.nn.Linear
-    num_inputs: int = eqx.static_field()
-    num_outputs: int = eqx.static_field()
+    num_obs: int = eqx.static_field()
+    num_act: int = eqx.static_field()
+    num_frames: int = eqx.static_field()
     min_std: float = eqx.static_field()
     max_std: float = eqx.static_field()
     var_scale: float = eqx.static_field()
     num_mixtures: int = eqx.static_field()
-    context_length: int = eqx.static_field()
 
     def __init__(
         self,
@@ -170,29 +167,28 @@ class DefaultHumanoidTransformerActor(eqx.Module):
         depth: int,
         num_heads: int,
         num_mixtures: int,
-        context_length: int,
+        num_frames: int,
     ) -> None:
         """Initialize the actor network."""
         # Project input to hidden size
-        in_key, out_key, transformer_key = jax.random.split(key, 3)
+        obs_key, act_key, out_key, transformer_key = jax.random.split(key, 4)
         self.obs_proj = eqx.nn.Linear(
             in_features=num_obs,
             out_features=hidden_size,
-            key=in_key,
+            key=obs_key,
         )
         self.act_proj = eqx.nn.Linear(
             in_features=num_act,
             out_features=hidden_size,
-            key=in_key,
+            key=act_key,
         )
 
         # Create Transformer layers
         self.transformer = Transformer(
-            input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=depth,
             num_heads=num_heads,
-            context_length=context_length,
+            context_length=num_frames * 2,  # obs + act
             key=transformer_key,
         )
 
@@ -209,26 +205,31 @@ class DefaultHumanoidTransformerActor(eqx.Module):
         self.max_std = max_std
         self.var_scale = var_scale
         self.num_mixtures = num_mixtures
-        self.context_length = context_length
+        self.num_frames = num_frames
 
     def forward(self, obs_n: Array, act_n: Array) -> distrax.Distribution:
         """Forward pass of the actor network.
-        
+
         Args:
             obs_n: Observation sequence [T, obs_dim]
             act_n: Action sequence [T, act_dim]
         """
+        chex.assert_shape(obs_n, (self.num_frames, self.num_obs))
+        chex.assert_shape(act_n, (self.num_frames, self.num_act))
+
         # Create and interleave obs and act embeddings.
         obs_emb = jax.vmap(self.obs_proj)(obs_n)  # [T, hidden_size]
         act_emb = jax.vmap(self.act_proj)(act_n)  # [T, hidden_size]
         interleaved_indices = jnp.arange(2 * obs_emb.shape[0]).reshape(2, -1).T.ravel()  # [0,L,1,L+1,2,L+2...]
-        x_emb = jnp.concatenate([obs_emb, act_emb])[interleaved_indices]
+        x_emb = jnp.concatenate([act_emb, obs_emb])[interleaved_indices]
 
         # Getting the CLS and predicting output.
         cls_emb = self.transformer.forward_sequence(x_emb)[-1]
         out_n = self.output_proj(cls_emb)
 
         # Splits the predictions into means, standard deviations, and logits.
+        # mean_n = out_n[:NUM_JOINTS]
+        # std_n = out_n[NUM_JOINTS:]
         slice_len = NUM_JOINTS * self.num_mixtures
         mean_nm = out_n[:slice_len].reshape(NUM_JOINTS, self.num_mixtures)
         std_nm = out_n[slice_len : slice_len * 2].reshape(NUM_JOINTS, self.num_mixtures)
@@ -253,10 +254,9 @@ class DefaultHumanoidTransformerCritic(eqx.Module):
     act_proj: eqx.nn.Linear
     transformer: Transformer
     output_proj: eqx.nn.Linear
-    num_inputs: int = eqx.static_field()
-    context_length: int = eqx.static_field()
     num_obs: int = eqx.static_field()
     num_act: int = eqx.static_field()
+    num_frames: int = eqx.static_field()
 
     def __init__(
         self,
@@ -266,29 +266,28 @@ class DefaultHumanoidTransformerCritic(eqx.Module):
         hidden_size: int,
         depth: int,
         num_heads: int,
-        context_length: int,
+        num_frames: int,
     ):
-        in_key, out_key, transformer_key = jax.random.split(key, 3)
-        self.obs_proj = eqx.nn.Linear(num_obs, hidden_size, key=in_key)
-        self.act_proj = eqx.nn.Linear(num_act, hidden_size, key=in_key)
+        obs_key, act_key, out_key, transformer_key = jax.random.split(key, 4)
+        self.obs_proj = eqx.nn.Linear(num_obs, hidden_size, key=obs_key)
+        self.act_proj = eqx.nn.Linear(num_act, hidden_size, key=act_key)
         self.transformer = Transformer(
-            input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=depth,
             num_heads=num_heads,
-            context_length=context_length,
+            context_length=num_frames * 2,  # obs + act
             key=transformer_key,
         )
         self.output_proj = eqx.nn.Linear(hidden_size, 1, key=out_key)
 
         self.num_obs = num_obs
         self.num_act = num_act
-        self.context_length = context_length
+        self.num_frames = num_frames
 
     def forward(self, obs_n: Array, act_n: Array) -> Array:
         """Forward pass of the critic network."""
-        chex.assert_shape(obs_n, (self.context_length, self.num_obs))
-        chex.assert_shape(act_n, (self.context_length, self.num_act))
+        chex.assert_shape(obs_n, (self.num_frames, self.num_obs))
+        chex.assert_shape(act_n, (self.num_frames, self.num_act))
 
         # Create and interleave obs and act embeddings.
         obs_emb = jax.vmap(self.obs_proj)(obs_n)
@@ -300,6 +299,7 @@ class DefaultHumanoidTransformerCritic(eqx.Module):
         cls_emb = self.transformer.forward_sequence(x_emb)[-1]
         out_n = self.output_proj(cls_emb)
         return out_n
+
 
 class DefaultHumanoidTransformerModel(eqx.Module):
     """Combined actor-critic model for the humanoid walking task.
@@ -324,13 +324,13 @@ class DefaultHumanoidTransformerModel(eqx.Module):
         hidden_size: int,
         depth: int,
         num_heads: int,
-        context_length: int,
+        num_frames: int,
     ) -> None:
         """Initialize the actor-critic model."""
         self.actor = DefaultHumanoidTransformerActor(
             key,
-            num_inputs=num_actor_inputs,
-            num_outputs=num_joints,
+            num_obs=num_actor_inputs,
+            num_act=num_joints,
             min_std=min_std,
             max_std=max_std,
             var_scale=0.5,
@@ -338,15 +338,16 @@ class DefaultHumanoidTransformerModel(eqx.Module):
             hidden_size=hidden_size,
             depth=depth,
             num_heads=num_heads,
-            context_length=context_length,
+            num_frames=num_frames,
         )
         self.critic = DefaultHumanoidTransformerCritic(
             key,
-            num_inputs=num_critic_inputs,
+            num_obs=num_critic_inputs,
+            num_act=num_joints,
             hidden_size=hidden_size,
             depth=depth,
             num_heads=num_heads,
-            context_length=context_length,
+            num_frames=num_frames,
         )
 
 
@@ -359,16 +360,16 @@ class HumanoidWalkingTransformerTaskConfig(HumanoidWalkingTaskConfig):
         help="The hidden size for the Transformer.",
     )
     depth: int = xax.field(
-        value=5,
+        value=3,
         help="The number of Transformer layers.",
     )
     num_heads: int = xax.field(
-        value=8,
+        value=1,
         help="The number of attention heads for the Transformer.",
     )
-    context_length: int = xax.field(
-        value=10,
-        help="The number of input frames to use for the Transformer.",
+    num_frames: int = xax.field(
+        value=3,
+        help="The number of obs act frames to use for the Transformer.",
     )
     num_mixtures: int = xax.field(
         value=5,
@@ -428,9 +429,11 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
             num_actor_mixtures=self.config.num_mixtures,
             hidden_size=self.config.hidden_size,
             depth=self.config.depth,
+            num_heads=self.config.num_heads,
+            num_frames=self.config.num_frames,
         )
 
-    def get_initial_model_carry(self, rng: PRNGKeyArray) -> None:
+    def get_initial_model_carry(self, rng: PRNGKeyArray) -> HistoricalCarry:
         """Gets initial carry state for the model.
 
         Args:
@@ -439,8 +442,24 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
         Returns:
             Initial Transformer hidden states for actor and critic.
         """
-        # TODO
-        raise NotImplementedError("Not implemented")
+        empty_obs = {
+            "joint_position_observation": jnp.zeros((self.config.num_frames, NUM_JOINTS)),
+            "joint_velocity_observation": jnp.zeros((self.config.num_frames, NUM_JOINTS)),
+            "actuator_force_observation": jnp.zeros((self.config.num_frames, NUM_JOINTS)),
+            "center_of_mass_inertia_observation": jnp.zeros((self.config.num_frames, 160)),
+            "center_of_mass_velocity_observation": jnp.zeros((self.config.num_frames, 96)),
+            "base_position_observation": jnp.zeros((self.config.num_frames, 3)),
+            "base_orientation_observation": jnp.zeros((self.config.num_frames, 4)),
+            "base_linear_velocity_observation": jnp.zeros((self.config.num_frames, 3)),
+            "base_angular_velocity_observation": jnp.zeros((self.config.num_frames, 3)),
+            "sensor_observation_imu_acc": jnp.zeros((self.config.num_frames, 3)),
+            "sensor_observation_imu_gyro": jnp.zeros((self.config.num_frames, 3)),
+            "timestep_observation": jnp.zeros((self.config.num_frames, 1)),
+        }
+        return HistoricalCarry(
+            observations=xax.FrozenDict(empty_obs),
+            actions=jnp.zeros((self.config.num_frames, NUM_JOINTS)),
+        )
 
     def run_actor(
         self,
@@ -479,6 +498,34 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
         )
 
         return model.forward(obs_n, actions)
+
+    def get_obs_act(self, trajectory: ksim.Trajectory, initial_history: HistoricalCarry) -> HistoricalCarry:
+        """Gets the observation and action history from a trajectory."""
+
+        def scan_fn(history: HistoricalCarry, transition: ksim.Trajectory) -> tuple[HistoricalCarry, HistoricalCarry]:
+            obs_history = history.observations
+            obs = jax.tree.map(lambda x, y: jnp.concatenate([x[1:], y[None]], axis=0), obs_history, transition.obs)
+            act = history.actions
+
+            # Like sample action, use new obs and old act.
+            emit = HistoricalCarry(observations=obs, actions=act)
+
+            # For next carry, we shift actions (or reset).
+            next_act = jnp.concatenate([act[1:], transition.action[None]], axis=0)
+            next_carry = jax.lax.cond(
+                transition.done,
+                lambda: self.get_initial_model_carry(jax.random.PRNGKey(0)),
+                lambda: HistoricalCarry(observations=obs, actions=next_act),
+            )
+
+            return next_carry, emit
+
+        _, obs_act = jax.lax.scan(
+            scan_fn,
+            initial_history,
+            trajectory,
+        )
+        return obs_act
 
     def run_critic(
         self,
@@ -550,25 +597,33 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
         Returns:
             A tuple of PPO variables and the next model carry state.
         """
-        assert isinstance(trajectory.aux_outputs, HistoricalCarry)
-        actions = trajectory.aux_outputs.actions
-        observations = trajectory.aux_outputs.observations
+        # Get observation and action history from trajectory
+        obs_act = self.get_obs_act(trajectory, model_carry)
+        actions_history = obs_act.actions
+        on_policy_actions = trajectory.action
+        observations = obs_act.observations
         commands = trajectory.command
 
-        def get_log_probs_values(actions: Array, observations: xax.FrozenDict[str, Array], commands: xax.FrozenDict[str, Array]) -> tuple[Array, Array]:
-            action_dist = self.run_actor(model.actor, observations, actions, commands)
-            log_probs = action_dist.log_prob(actions)
-            values = self.run_critic(model.critic, observations, actions, commands)
+        def get_log_probs_values(
+            action_history: Array,
+            on_policy_action: Array,
+            observations: xax.FrozenDict[str, Array],
+            commands: xax.FrozenDict[str, Array],
+        ) -> tuple[Array, Array]:
+            action_dist = self.run_actor(model.actor, observations, action_history, commands)
+            log_probs = action_dist.log_prob(on_policy_action)
+            assert isinstance(log_probs, Array)
+            values = self.run_critic(model.critic, observations, action_history, commands)
             return log_probs, values.squeeze(-1)
 
-        log_probs, values = jax.vmap(get_log_probs_values)(actions, observations, commands)
+        log_probs, values = jax.vmap(get_log_probs_values)(actions_history, on_policy_actions, observations, commands)
         ppo_variables = ksim.PPOVariables(
             log_probs=log_probs,
             values=values,
         )
 
         # Passing in the next historical carry to the next rollout.
-        next_model_carry = trajectory.aux_outputs[-1]
+        next_model_carry = jax.tree.map(lambda x: x[-1], obs_act)
 
         return ppo_variables, next_model_carry
 
@@ -596,10 +651,12 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
             argmax: Whether to take the mode of the distribution instead of sampling.
 
         Returns:
-            A sampled action with its carry state and auxiliary outputs.
+            A sampled action with its carry state.
         """
         # Shifting the observations by one (actions are already shifted).
-        obs_n = jax.tree.map(lambda x, y: jnp.concatenate([x[1:], y], axis=-1), model_carry.observations, observations)
+        obs_n = jax.tree.map(
+            lambda x, y: jnp.concatenate([x[1:], y[None]], axis=0), model_carry.observations, observations
+        )
         act_n = model_carry.actions
 
         # Runs the actor model to get the action distribution.
@@ -612,7 +669,7 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
 
         action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
 
-        # Updates the historical carry (which is also used during training).
+        # Updates the historical carry and shifts actions.
         next_carry = HistoricalCarry(
             observations=obs_n,
             actions=jnp.concatenate([act_n[1:], action_j[None]], axis=0),
@@ -621,27 +678,27 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
         return ksim.Action(
             action=action_j,
             carry=next_carry,
-            aux_outputs=next_carry,
+            aux_outputs=None,
         )
 
 
 if __name__ == "__main__":
     # To run training, use the following command:
-    #   python -m iclrobot.dh_walking.dh_walking_transformer
+    #   python -m iclrobot.dh_walking.dh_walking_Transformer
     # To visualize the environment, use the following command:
-    #   python -m iclrobot.dh_walking.dh_walking_transformer run_environment=True
+    #   python -m iclrobot.dh_walking.dh_walking_Transformer run_environment=True
     # On MacOS or other devices with less memory, you can change the number
     # of environments and batch size to reduce memory usage. Here's an example
     # from the command line:
-    #   python -m iclrobot.dh_walking.dh_walking_transformer num_envs=8 rollouts_per_batch=4
+    #   python -m iclrobot.dh_walking.dh_walking_Transformer num_envs=8 rollouts_per_batch=4
     HumanoidWalkingTransformerTask.launch(
         HumanoidWalkingTransformerTaskConfig(
             # Training parameters.
             num_envs=2048,
-            batch_size=256,
+            batch_size=128,
             num_passes=4,
             epochs_per_log_step=1,
-            rollout_length_seconds=10.0,
+            rollout_length_seconds=5.0,
             # Simulation parameters.
             dt=0.005,
             ctrl_dt=0.02,
