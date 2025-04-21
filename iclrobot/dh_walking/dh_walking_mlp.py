@@ -204,19 +204,9 @@ class HumanoidWalkingMLPTaskConfig(HumanoidWalkingTaskConfig):
         value=5,
         help="The number of mixtures for the actor.",
     )
-    history_length: int = xax.field(
-        value=10,
-        help="The history length for the MLPs.",
-    )
 
 
 Config = TypeVar("Config", bound=HumanoidWalkingMLPTaskConfig)
-
-
-@jax.tree_util.register_dataclass
-@dataclass
-class HumanoidWalkingMLPModelCarry:
-    action_history: Array
 
 
 class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
@@ -231,10 +221,13 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         - NUM_JOINTS (positions)
         - NUM_JOINTS (velocities)
         - 3 (imu_acc)
+        - 3 (imu_gyro)
         - 4 (base_quat)
-        - NUM_JOINTS * history_length (action history)
+        - 3 (lin_vel_obs)
+        - 3 (ang_vel_obs)
         """
-        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 4 + NUM_JOINTS * self.config.history_length
+        res = 2 + NUM_JOINTS + NUM_JOINTS + 3 + 3 + 4 + 3 + 3
+        return res
 
     @property
     def critic_num_inputs(self) -> int:
@@ -255,7 +248,6 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         - 3 (ang_vel_obs)
         """
         res = 2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3
-        res += NUM_JOINTS * self.config.history_length
         return res
 
     def get_model(self, key: PRNGKeyArray) -> DefaultHumanoidModel:
@@ -269,17 +261,16 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
             num_mixtures=self.config.num_mixtures,
         )
 
-    def get_initial_model_carry(self, rng: PRNGKeyArray) -> HumanoidWalkingMLPModelCarry:
+    def get_initial_model_carry(self, rng: PRNGKeyArray) -> None:
         """Gets initial carry state for the model."""
-        action_history = jnp.zeros((self.config.history_length, NUM_JOINTS))
-        return HumanoidWalkingMLPModelCarry(action_history)
+        return None
 
     def run_actor(
         self,
         model: DefaultHumanoidActor,
         observations: xax.FrozenDict[str, Array],
         commands: xax.FrozenDict[str, Array],
-        model_carry: HumanoidWalkingMLPModelCarry,
+        model_carry: None,
     ) -> distrax.Distribution:
         """Runs the actor network to get an action distribution.
 
@@ -287,7 +278,7 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
             model: The actor network.
             observations: Current observations.
             commands: Current commands.
-            model_carry: Optional model carry state containing action history.
+            model_carry: Unused model carry state.
 
         Returns:
             A distribution over actions.
@@ -296,9 +287,11 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
+        lin_vel_obs_3 = observations["base_linear_velocity_observation"]
+        ang_vel_obs_3 = observations["base_angular_velocity_observation"]
+        imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         base_quat_4 = observations["base_orientation_observation"]
 
-        action_history = model_carry.action_history
         obs_n = jnp.concatenate(
             [
                 jnp.cos(timestep_1),  # 1
@@ -306,8 +299,10 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
                 imu_acc_3 / 50.0,  # 3
+                imu_gyro_3 / 3.0,  # 3
                 base_quat_4,  # 4
-                action_history.reshape(-1),  # history_length * NUM_JOINTS
+                lin_vel_obs_3,  # 3
+                ang_vel_obs_3,  # 3
             ],
             axis=-1,
         )
@@ -319,7 +314,7 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         model: DefaultHumanoidCritic,
         observations: xax.FrozenDict[str, Array],
         commands: xax.FrozenDict[str, Array],
-        model_carry: HumanoidWalkingMLPModelCarry,
+        model_carry: None,
     ) -> Array:
         """Runs the critic network to get state values.
 
@@ -327,7 +322,8 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
             model: The critic network.
             observations: Current observations.
             commands: Current commands.
-            model_carry: Optional model carry state containing action history.
+            model_carry: Unused model carry state.
+
         Returns:
             Estimated state values.
         """
@@ -359,7 +355,6 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
                 base_quat_4,  # 4
                 lin_vel_obs_3,  # 3
                 ang_vel_obs_3,  # 3
-                model_carry.action_history.reshape(-1),  # history_length * NUM_JOINTS
             ],
             axis=-1,
         )
@@ -370,15 +365,15 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         self,
         model: DefaultHumanoidModel,
         trajectory: ksim.Trajectory,
-        model_carry: HumanoidWalkingMLPModelCarry,
+        model_carry: None,
         rng: PRNGKeyArray,
-    ) -> tuple[ksim.PPOVariables, HumanoidWalkingMLPModelCarry]:
+    ) -> tuple[ksim.PPOVariables, None]:
         """Computes PPO variables for training.
 
         Args:
             model: The actor-critic model.
             trajectory: The trajectory to compute variables for.
-            model_carry: Model carry state containing action history.
+            model_carry: Unused model carry state.
             rng: Random number generator key.
 
         Returns:
@@ -404,14 +399,12 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
             values=values_tj.squeeze(-1),
         )
 
-        # Next action history.
-        last_model_carry = jax.tree.map(lambda x: x[-1], trajectory.aux_outputs)
-        return ppo_variables, last_model_carry
+        return ppo_variables, None
 
     def sample_action(
         self,
         model: DefaultHumanoidModel,
-        model_carry: HumanoidWalkingMLPModelCarry,
+        model_carry: None,
         physics_model: ksim.PhysicsModel,
         physics_state: ksim.PhysicsState,
         observations: xax.FrozenDict[str, Array],
@@ -438,12 +431,9 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
             model=model.actor, observations=observations, commands=commands, model_carry=model_carry
         )
         action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
-        action_history = jnp.concatenate([model_carry.action_history[1:], action_j[None]], axis=0)
-        next_model_carry = HumanoidWalkingMLPModelCarry(action_history)
         return ksim.Action(
             action=action_j,
-            carry=next_model_carry,
-            aux_outputs=next_model_carry,  # will be cached in trajectory
+            carry=None,
         )
 
 

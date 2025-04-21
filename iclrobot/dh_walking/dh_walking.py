@@ -293,13 +293,13 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
         """Gets randomizers for domain randomization during training."""
         if self.config.randomize_physics:
             return [
-                ksim.StaticFrictionRandomizer(scale_lower=0.2, scale_upper=4.0),
-                ksim.ArmatureRandomizer(scale_lower=0.85, scale_upper=1.15),
+                ksim.StaticFrictionRandomizer(scale_lower=0.1, scale_upper=10.0),
+                ksim.ArmatureRandomizer(scale_lower=0.75, scale_upper=1.25),
                 ksim.MassMultiplicationRandomizer.from_body_name(
-                    physics_model, "torso", scale_lower=0.85, scale_upper=1.15
+                    physics_model, "torso", scale_lower=0.75, scale_upper=1.25
                 ),
-                ksim.JointDampingRandomizer(scale_lower=0.85, scale_upper=1.15),
-                ksim.JointZeroPositionRandomizer(scale_lower=-0.15, scale_upper=0.15),
+                ksim.JointDampingRandomizer(scale_lower=0.75, scale_upper=1.25),
+                ksim.JointZeroPositionRandomizer(scale_lower=-0.20, scale_upper=0.20),
             ]
         else:
             return []
