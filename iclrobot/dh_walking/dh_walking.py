@@ -343,7 +343,7 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
         """Creates actuators for controlling the robot's joints."""
         assert metadata is not None, "Metadata is required"
         return BiasedPositionActuators(
-            bias_range=(-0.2, 0.2) if self.config.randomize else (0.0, 0.0),
+            bias_range=(-0.1, 0.1) if self.config.randomize else (0.0, 0.0),
             physics_model=physics_model,
             joint_name_to_metadata=metadata,
         )

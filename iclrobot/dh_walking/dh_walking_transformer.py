@@ -404,10 +404,12 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
         - NUM_JOINTS (positions)
         - NUM_JOINTS (velocities)
         - 3 (imu_acc)
+        - 3 (imu_gyro)
         - 4 (base_quat)
-        - NUM_JOINTS * history_length (action history)
+        - 3 (lin_vel_obs)
+        - 3 (ang_vel_obs)
         """
-        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 4
+        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 3 + 4 + 3 + 3
 
     @property
     def critic_num_inputs(self) -> int:
