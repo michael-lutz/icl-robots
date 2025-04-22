@@ -382,7 +382,7 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
 
         # Vectorize over the time dimensions.
         def get_log_prob(transition: ksim.Trajectory) -> Array:
-            action_dist_tj = self.run_actor(model.actor, transition.obs, transition.command, transition.aux_outputs)
+            action_dist_tj = self.run_actor(model.actor, transition.obs, transition.command, None)
             log_probs_tj = action_dist_tj.log_prob(transition.action)
             assert isinstance(log_probs_tj, Array)
             return log_probs_tj
@@ -391,8 +391,8 @@ class HumanoidWalkingMLPTask(HumanoidWalkingTask[Config], Generic[Config]):
         assert isinstance(log_probs_tj, Array)
 
         # Vectorize over the time dimensions.
-        values_tj = jax.vmap(self.run_critic, in_axes=(None, 0, 0, 0))(
-            model.critic, trajectory.obs, trajectory.command, trajectory.aux_outputs
+        values_tj = jax.vmap(self.run_critic, in_axes=(None, 0, 0, None))(
+            model.critic, trajectory.obs, trajectory.command, None
         )
         ppo_variables = ksim.PPOVariables(
             log_probs=log_probs_tj,
@@ -459,6 +459,6 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             max_action_latency=0.0,
             min_action_latency=0.0,
-            randomize_physics=False,
+            randomize=False,
         ),
     )

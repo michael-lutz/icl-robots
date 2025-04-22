@@ -13,6 +13,7 @@ import numpy as np
 import ksim
 import mujoco
 import optax
+from ksim.actuators import NoiseType
 from ksim.types import PhysicsModel
 from ksim.utils.reference_motion import (
     ReferenceMapping,
@@ -23,7 +24,7 @@ from ksim.utils.reference_motion import (
     visualize_reference_points,
 )
 import xax
-from jaxtyping import Array
+from jaxtyping import Array, PRNGKeyArray, PyTree
 from kscale.web.gen.api import JointMetadataOutput
 from mujoco import mjx
 
@@ -160,11 +161,23 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         value=0.0,
         help="The maximum latency of the action.",
     )
+    iterations: int = xax.field(
+        value=8,
+        help="The number of iterations to use for the solver.",
+    )
+    ls_iterations: int = xax.field(
+        value=8,
+        help="The number of line search iterations to use for the solver.",
+    )
 
     # Rendering parameters.
     render_track_body_id: int | None = xax.field(
         value=0,
         help="The body id to track with the render camera.",
+    )
+    full_size_render: bool = xax.field(
+        value=True,
+        help="Whether to render the full size video.",
     )
 
     # Checkpointing parameters.
@@ -174,7 +187,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
     )
 
     # Experimental parameters.
-    randomize_physics: bool = xax.field(
+    randomize: bool = xax.field(
         value=False,
         help="Whether to randomize the physics during training.",
     )
@@ -193,16 +206,16 @@ class NaiveForwardReward(ksim.Reward):
 
     clip_max: float = attrs.field(default=5.0)
 
-    def __call__(self, trajectory: ksim.Trajectory, _: None) -> tuple[Array, None]:
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         """Compute the reward based on forward velocity.
 
         Args:
             trajectory: The trajectory to compute the reward for.
 
         Returns:
-            A tuple containing the clipped forward velocity reward and None for the carry state.
+            A tuple containing the clipped forward velocity reward.
         """
-        return trajectory.qvel[..., 0].clip(max=self.clip_max), None
+        return trajectory.qvel[..., 0].clip(max=self.clip_max)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -232,6 +245,51 @@ class QposReferenceMotionReward(ksim.Reward):
         mean_error = error.mean(axis=-1)
         reward = jnp.exp(-mean_error * self.sensitivity)
         return reward, None
+
+
+class BiasedPositionActuators(ksim.MITPositionActuators, ksim.StatefulActuators):
+    """Actuator controller operating on position."""
+
+    def __init__(
+        self,
+        bias_range: tuple[float, float],
+        physics_model: PhysicsModel,
+        joint_name_to_metadata: dict[str, JointMetadataOutput],
+        action_noise: float = 0.0,
+        action_noise_type: NoiseType = "none",
+        torque_noise: float = 0.0,
+        torque_noise_type: NoiseType = "none",
+        ctrl_clip: list[float] | None = None,
+        freejoint_first: bool = True,
+    ) -> None:
+        """Creates easily vector multipliable kps and kds."""
+        super().__init__(
+            physics_model=physics_model,
+            joint_name_to_metadata=joint_name_to_metadata,
+            action_noise=action_noise,
+            action_noise_type=action_noise_type,
+            torque_noise=torque_noise,
+            torque_noise_type=torque_noise_type,
+            ctrl_clip=ctrl_clip,
+            freejoint_first=freejoint_first,
+        )
+        self.bias_range = bias_range
+
+    def get_stateful_ctrl(
+        self,
+        action: Array,
+        physics_data: ksim.PhysicsData,
+        actuator_state: PyTree,
+        rng: PRNGKeyArray,
+    ) -> tuple[Array, PyTree]:
+        """Get the control signal from the action vector."""
+        bias = actuator_state
+        action = action + bias
+        return super().get_ctrl(action, physics_data, rng), actuator_state
+
+    def get_initial_state(self, physics_data: ksim.PhysicsData, rng: PRNGKeyArray) -> PyTree:
+        """Get the default state for the actuator."""
+        return jax.random.uniform(rng, (NUM_JOINTS,), minval=self.bias_range[0], maxval=self.bias_range[1])
 
 
 class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
@@ -284,14 +342,15 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
     ) -> ksim.Actuators:
         """Creates actuators for controlling the robot's joints."""
         assert metadata is not None, "Metadata is required"
-        return ksim.MITPositionActuators(
+        return BiasedPositionActuators(
+            bias_range=(-0.2, 0.2) if self.config.randomize else (0.0, 0.0),
             physics_model=physics_model,
             joint_name_to_metadata=metadata,
         )
 
     def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
         """Gets randomizers for domain randomization during training."""
-        if self.config.randomize_physics:
+        if self.config.randomize:
             return [
                 ksim.StaticFrictionRandomizer(scale_lower=0.1, scale_upper=10.0),
                 ksim.ArmatureRandomizer(scale_lower=0.75, scale_upper=1.25),

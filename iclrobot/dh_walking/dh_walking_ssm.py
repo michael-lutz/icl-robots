@@ -118,6 +118,7 @@ class DPLRSSMBlock(BaseSSMBlock):
     p_vec: Array
     q_vec: Array
     b_mat: Array
+    bias: Array
 
     def __init__(
         self,
@@ -126,11 +127,12 @@ class DPLRSSMBlock(BaseSSMBlock):
         key: PRNGKeyArray,
         rank: int = 4,
     ) -> None:
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
         self.a_diag = glorot(k1, (hidden_size,))
         self.p_vec = glorot(k2, (hidden_size, rank))
         self.q_vec = glorot(k3, (hidden_size, rank))
         self.b_mat = glorot(k4, (hidden_size, hidden_size))
+        self.bias = glorot(k5, (hidden_size,))
 
     def get_a_mat(self, x: Array) -> Array:
         """Construct discretized A matrix: diag(a_diag) + P Q^T, exponentiated."""
@@ -145,7 +147,7 @@ class DPLRSSMBlock(BaseSSMBlock):
         """Performs a single forward pass."""
         A = self.get_a_mat(x)
         B = self.get_b_mat(x)
-        return A @ h + B @ x
+        return A @ h + B @ x + self.bias
 
 
 class SSM(eqx.Module):
@@ -162,7 +164,7 @@ class SSM(eqx.Module):
         output_size: int,
         hidden_size: int,
         num_layers: int,
-        block_type: Literal["diagonal", "full_rank", "dplr"] = "full_rank",
+        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
         skip_connections: bool = False,
         discretize: bool = False,
         *,
@@ -186,7 +188,7 @@ class SSM(eqx.Module):
                         raise ValueError("Full rank blocks do not support discretization due to instability.")
                     return SSMBlock(hidden_size, key=key)
                 case "dplr":
-                    return DPLRSSMBlock(hidden_size, key=key)
+                    return DPLRSSMBlock(hidden_size, key=key, rank=NUM_JOINTS)
                 case _:
                     raise ValueError(f"Unknown block type: {block_type}")
 
@@ -202,7 +204,9 @@ class SSM(eqx.Module):
         for i, block in enumerate(self.blocks):
             h = block.forward(hs[i], x)
             new_hs.append(h)
-            xh = jax.nn.gelu(h)
+
+            # We apply activations in the vertical direction.
+            xh = jax.nn.tanh(h)
             x = xh + x if self.skip_connections else xh
         y = self.output_proj(x)
         new_hs = jnp.stack(new_hs, axis=0)
@@ -386,10 +390,12 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         - NUM_JOINTS (positions)
         - NUM_JOINTS (velocities)
         - 3 (imu_acc)
+        - 3 (imu_gyro)
         - 4 (base_quat)
-        - NUM_JOINTS * history_length (action history)
+        - 3 (lin_vel_obs)
+        - 3 (ang_vel_obs)
         """
-        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 4
+        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 3 + 4 + 3 + 3
 
     @property
     def critic_num_inputs(self) -> int:
@@ -468,7 +474,10 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
+        imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         base_quat_4 = observations["base_orientation_observation"]
+        lin_vel_obs_3 = observations["base_linear_velocity_observation"]
+        ang_vel_obs_3 = observations["base_angular_velocity_observation"]
 
         obs_n = jnp.concatenate(
             [
@@ -477,7 +486,10 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
                 imu_acc_3 / 50.0,  # 3
+                imu_gyro_3 / 3.0,  # 3
                 base_quat_4,  # 4
+                lin_vel_obs_3,  # 3
+                ang_vel_obs_3,  # 3
             ],
             axis=-1,
         )
@@ -646,6 +658,11 @@ if __name__ == "__main__":
     #   python -m iclrobot.dh_walking.dh_walking_ssm num_envs=8 rollouts_per_batch=4
     HumanoidWalkingSSMTask.launch(
         HumanoidWalkingSSMTaskConfig(
+            # Model parameters.
+            hidden_size=212,
+            depth=5,
+            block_type="full_rank",
+            discretize=False,
             # Training parameters.
             num_envs=2048,
             batch_size=256,
@@ -657,6 +674,6 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             max_action_latency=0.0,
             min_action_latency=0.0,
-            randomize_physics=True,
+            randomize=True,
         ),
     )

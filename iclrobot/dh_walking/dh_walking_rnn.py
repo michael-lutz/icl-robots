@@ -304,10 +304,12 @@ class HumanoidWalkingRNNTask(HumanoidWalkingTask[Config], Generic[Config]):
         - NUM_JOINTS (positions)
         - NUM_JOINTS (velocities)
         - 3 (imu_acc)
+        - 3 (imu_gyro)
         - 4 (base_quat)
-        - NUM_JOINTS * history_length (action history)
+        - 3 (lin_vel_obs)
+        - 3 (ang_vel_obs)
         """
-        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 4
+        return 2 + NUM_JOINTS + NUM_JOINTS + 3 + 3 + 4 + 3 + 3
 
     @property
     def critic_num_inputs(self) -> int:
@@ -379,7 +381,10 @@ class HumanoidWalkingRNNTask(HumanoidWalkingTask[Config], Generic[Config]):
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
+        imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         base_quat_4 = observations["base_orientation_observation"]
+        lin_vel_obs_3 = observations["base_linear_velocity_observation"]
+        ang_vel_obs_3 = observations["base_angular_velocity_observation"]
 
         obs_n = jnp.concatenate(
             [
@@ -388,7 +393,10 @@ class HumanoidWalkingRNNTask(HumanoidWalkingTask[Config], Generic[Config]):
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
                 imu_acc_3 / 50.0,  # 3
+                imu_gyro_3 / 3.0,  # 3
                 base_quat_4,  # 4
+                lin_vel_obs_3,  # 3
+                ang_vel_obs_3,  # 3
             ],
             axis=-1,
         )
@@ -568,6 +576,6 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             max_action_latency=0.0,
             min_action_latency=0.0,
-            randomize_physics=True,
+            randomize=True,
         ),
     )
