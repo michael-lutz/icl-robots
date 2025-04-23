@@ -448,12 +448,16 @@ if __name__ == "__main__":
     #   python -m iclrobot.dh_walking.dh_walking_mlp num_envs=8 rollouts_per_batch=4
     HumanoidWalkingMLPTask.launch(
         HumanoidWalkingMLPTaskConfig(
+            # Model parameters.
+            hidden_size=256,
+            depth=5,
+            num_mixtures=5,
             # Training parameters.
             num_envs=2048,
             batch_size=256,
             num_passes=4,
             epochs_per_log_step=1,
-            rollout_length_seconds=10.0,
+            rollout_length_seconds=5.0,
             # Simulation parameters.
             dt=0.005,
             ctrl_dt=0.02,

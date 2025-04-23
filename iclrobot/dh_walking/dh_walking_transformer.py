@@ -498,7 +498,10 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
+        imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         base_quat_4 = observations["base_orientation_observation"]
+        lin_vel_obs_3 = observations["base_linear_velocity_observation"]
+        ang_vel_obs_3 = observations["base_angular_velocity_observation"]
 
         obs_n = jnp.concatenate(
             [
@@ -507,7 +510,10 @@ class HumanoidWalkingTransformerTask(HumanoidWalkingTask[Config], Generic[Config
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
                 imu_acc_3 / 50.0,  # 3
+                imu_gyro_3 / 3.0,  # 3
                 base_quat_4,  # 4
+                lin_vel_obs_3,  # 3
+                ang_vel_obs_3,  # 3
             ],
             axis=-1,
         )
@@ -710,7 +716,7 @@ if __name__ == "__main__":
         HumanoidWalkingTransformerTaskConfig(
             # Training parameters.
             num_envs=2048,
-            batch_size=128,
+            batch_size=256,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=5.0,
@@ -719,6 +725,6 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             max_action_latency=0.0,
             min_action_latency=0.0,
-            randomize_physics=True,
+            randomize=True,
         ),
     )
