@@ -20,6 +20,8 @@ from iclrobot.dh_walking.dh_walking import (
     HumanoidWalkingTaskConfig,
 )
 
+SSMBlockType = Literal["diagonal", "discrete_diagonal", "full_rank", "dplr", "gated", "discrete_dplr"]
+
 
 def glorot(key: PRNGKeyArray, shape: tuple[int, ...]) -> Array:
     return jax.random.uniform(key, shape, minval=-1.0, maxval=1.0) * jnp.sqrt(2 / sum(shape))
@@ -28,12 +30,6 @@ def glorot(key: PRNGKeyArray, shape: tuple[int, ...]) -> Array:
 class BaseSSMBlock(eqx.Module, ABC):
     @abstractmethod
     def forward(self, h: Array, x: Array) -> Array: ...
-
-    @abstractmethod
-    def get_a_mat(self, x: Array) -> Array: ...
-
-    @abstractmethod
-    def get_b_mat(self, x: Array) -> Array: ...
 
 
 class SSMBlock(BaseSSMBlock):
@@ -45,17 +41,9 @@ class SSMBlock(BaseSSMBlock):
         self.a_mat = glorot(key_a, (hidden_size, hidden_size))
         self.b_mat = glorot(key_b, (hidden_size, hidden_size))
 
-    def get_a_mat(self, x: Array) -> Array:
-        return self.a_mat
-
-    def get_b_mat(self, x: Array) -> Array:
-        return self.b_mat
-
     def forward(self, h: Array, x: Array) -> Array:
         """Performs a single forward pass."""
-        a_mat = self.get_a_mat(x)
-        b_mat = self.get_b_mat(x)
-        h = a_mat @ h + b_mat.T @ x
+        h = self.a_mat @ h + self.b_mat.T @ x
         return h
 
 
@@ -68,21 +56,13 @@ class DiagSSMBlock(BaseSSMBlock):
         self.a_diag = glorot(keys[0], (hidden_size,))
         self.b_mat = glorot(keys[1], (hidden_size, hidden_size))
 
-    def get_a_mat(self, x: Array) -> Array:
-        return self.a_diag
-
-    def get_b_mat(self, x: Array) -> Array:
-        return self.b_mat
-
     def forward(self, h: Array, x: Array) -> Array:
         """Performs a single forward pass."""
-        a_diag = self.get_a_mat(x)
-        b_mat = self.get_b_mat(x)
-        h = a_diag * h + b_mat.T @ x
+        h = self.a_diag * h + self.b_mat.T @ x
         return h
 
 
-class DiscreteDiagSSMBlock(DiagSSMBlock):
+class DiscretizedDiagSSMBlock(DiagSSMBlock):
     delta: Array
 
     def __init__(
@@ -112,13 +92,18 @@ class DiscreteDiagSSMBlock(DiagSSMBlock):
         b_discrete = delta_a_inv * (exp_a_diag - 1) * delta_b_mat
         return b_discrete
 
+    def forward(self, h: Array, x: Array) -> Array:
+        """Performs a single forward pass."""
+        a_diag = self.get_a_mat(x)
+        b_mat = self.get_b_mat(x)
+        return a_diag * h + b_mat.T @ x
+
 
 class DPLRSSMBlock(BaseSSMBlock):
     a_diag: Array
     p_vec: Array
     q_vec: Array
     b_mat: Array
-    bias: Array
 
     def __init__(
         self,
@@ -132,28 +117,81 @@ class DPLRSSMBlock(BaseSSMBlock):
         self.p_vec = glorot(k2, (hidden_size, rank))
         self.q_vec = glorot(k3, (hidden_size, rank))
         self.b_mat = glorot(k4, (hidden_size, hidden_size))
-        self.bias = glorot(k5, (hidden_size,))
-
-    def get_a_mat(self, x: Array) -> Array:
-        """Construct discretized A matrix: diag(a_diag) + P Q^T, exponentiated."""
-        a_mat = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
-        return a_mat
-
-    def get_b_mat(self, x: Array) -> Array:
-        """Discretize B using: ∫ exp(A τ) dτ B ≈ A^{-1}(exp(A Δ) - I) B"""
-        return self.b_mat
 
     def forward(self, h: Array, x: Array) -> Array:
         """Performs a single forward pass."""
-        A = self.get_a_mat(x)
-        B = self.get_b_mat(x)
-        return A @ h + B @ x + self.bias
+        a_dplr = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
+        return a_dplr @ h + self.b_mat.T @ x
+
+
+class DiscretizedDPLRSSMBlock(BaseSSMBlock):
+    a_diag: Array
+    p_vec: Array
+    q_vec: Array
+    b_mat: Array
+    delta: float
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        key: PRNGKeyArray,
+        rank: int = 4,
+        delta: float = 1.0,
+    ) -> None:
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.a_diag = glorot(k1, (hidden_size,))
+        self.p_vec = glorot(k2, (hidden_size, rank))
+        self.q_vec = glorot(k3, (hidden_size, rank))
+        self.b_mat = glorot(k4, (hidden_size, hidden_size))
+        self.delta = delta  # keeping constant since can be learned elsewhere
+
+    def forward(self, h: Array, x: Array) -> Array:
+        # A_dplr = diag(a) + P @ Q^T
+        A_dplr = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
+
+        # Discretized A and B
+        A_disc = jnp.eye(h.shape[0]) + self.delta * A_dplr
+        B_disc = self.delta * self.b_mat
+
+        return A_disc @ h + B_disc.T @ x
+
+
+class GatedSSMBlock(BaseSSMBlock):
+    a_diag: Array
+    p_vec: Array
+    q_vec: Array
+    b_mat: Array
+    b_gate_proj: eqx.nn.Linear
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        key: PRNGKeyArray,
+        rank: int = 4,
+    ) -> None:
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        self.a_diag = glorot(k1, (hidden_size,))
+        self.p_vec = glorot(k2, (hidden_size, rank))
+        self.q_vec = glorot(k3, (hidden_size, rank))
+        self.b_mat = glorot(k4, (hidden_size, hidden_size))
+        self.b_gate_proj = eqx.nn.Linear(hidden_size, hidden_size, key=k5)
+
+    def forward(self, h: Array, x: Array) -> Array:
+        """Performs a single forward pass."""
+        a_dplr = jnp.diag(self.a_diag) + self.p_vec @ self.q_vec.T
+
+        # Doing gating in the output space saves memory.
+        gate = jax.nn.sigmoid(self.b_gate_proj(x))
+        b_proj = self.b_mat.T @ x
+        return a_dplr @ h + gate * b_proj
 
 
 class SSM(eqx.Module):
     input_proj: eqx.nn.Linear
     output_proj: eqx.nn.Linear
-    blocks: list[BaseSSMBlock]
+    ssm_blocks: list[BaseSSMBlock]
     num_layers: int = eqx.static_field()
     hidden_size: int = eqx.static_field()
     skip_connections: bool = eqx.static_field()
@@ -164,35 +202,37 @@ class SSM(eqx.Module):
         output_size: int,
         hidden_size: int,
         num_layers: int,
-        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
+        block_type: SSMBlockType = "dplr",
         skip_connections: bool = False,
         discretize: bool = False,
         *,
         key: PRNGKeyArray,
     ) -> None:
-        input_key, output_key, block_key = jax.random.split(key, 3)
+        input_key, output_key, ssm_key = jax.random.split(key, 3)
+        ssm_block_keys = jax.random.split(ssm_key, num_layers)
         self.input_proj = eqx.nn.Linear(input_size, hidden_size, key=input_key)
         self.output_proj = eqx.nn.Linear(hidden_size, output_size, key=output_key)
-        block_keys = jax.random.split(block_key, num_layers)
 
         def get_block(key: PRNGKeyArray) -> BaseSSMBlock:
             match block_type:
                 case "diagonal":
-                    return (
-                        DiscreteDiagSSMBlock(hidden_size, key=key, init_delta=0.1)
-                        if discretize
-                        else DiagSSMBlock(hidden_size, key=key)
-                    )
+                    return DiagSSMBlock(hidden_size, key=key)
+                case "discrete_diagonal":
+                    return DiscretizedDiagSSMBlock(hidden_size, key=key)
                 case "full_rank":
                     if discretize:
                         raise ValueError("Full rank blocks do not support discretization due to instability.")
                     return SSMBlock(hidden_size, key=key)
                 case "dplr":
                     return DPLRSSMBlock(hidden_size, key=key, rank=NUM_JOINTS)
+                case "discrete_dplr":
+                    return DiscretizedDPLRSSMBlock(hidden_size, key=key, rank=NUM_JOINTS)
+                case "gated":
+                    return GatedSSMBlock(hidden_size, key=key, rank=NUM_JOINTS)
                 case _:
                     raise ValueError(f"Unknown block type: {block_type}")
 
-        self.blocks = [get_block(block_keys[i]) for i in range(num_layers)]
+        self.ssm_blocks = [get_block(ssm_block_keys[i]) for i in range(num_layers)]
         self.skip_connections = skip_connections
         self.num_layers = num_layers
         self.hidden_size = hidden_size
@@ -201,12 +241,12 @@ class SSM(eqx.Module):
         """Performs a single forward pass."""
         x = self.input_proj(x)
         new_hs = []
-        for i, block in enumerate(self.blocks):
+        for i, block in enumerate(self.ssm_blocks):
             h = block.forward(hs[i], x)
             new_hs.append(h)
 
-            # We apply activations in the vertical direction.
-            xh = jax.nn.tanh(h)
+            # We apply non-linearities in the vertical direction.
+            xh = jax.nn.gelu(h)
             x = xh + x if self.skip_connections else xh
         y = self.output_proj(x)
         new_hs = jnp.stack(new_hs, axis=0)
@@ -235,7 +275,7 @@ class DefaultHumanoidSSMActor(eqx.Module):
         var_scale: float,
         hidden_size: int,
         depth: int,
-        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
+        block_type: SSMBlockType = "dplr",
         discretize: bool = False,
         num_mixtures: int = 5,
     ) -> None:
@@ -289,7 +329,7 @@ class DefaultHumanoidSSMCritic(eqx.Module):
         num_inputs: int,
         hidden_size: int,
         depth: int,
-        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
+        block_type: SSMBlockType = "dplr",
         discretize: bool = False,
     ) -> None:
         num_outputs = 1
@@ -324,7 +364,7 @@ class DefaultHumanoidSSMModel(eqx.Module):
         num_joints: int,
         hidden_size: int,
         depth: int,
-        block_type: Literal["diagonal", "full_rank", "dplr"] = "dplr",
+        block_type: SSMBlockType = "dplr",
         discretize: bool = False,
         num_mixtures: int = 5,
     ) -> None:
@@ -418,11 +458,11 @@ class HumanoidWalkingSSMTask(HumanoidWalkingTask[Config], Generic[Config]):
         return 2 + NUM_JOINTS + NUM_JOINTS + 160 + 96 + 3 + 3 + NUM_JOINTS + 3 + 4 + 3 + 3
 
     def get_model(self, key: PRNGKeyArray) -> DefaultHumanoidSSMModel:
-        valid_types = get_args(Literal["diagonal", "full_rank", "dplr"])
+        valid_types = get_args(SSMBlockType)
         if self.config.block_type not in valid_types:
             raise ValueError(f"Invalid block_type: {self.config.block_type}. Must be one of {valid_types}")
 
-        block_type = cast(Literal["diagonal", "full_rank", "dplr"], self.config.block_type)
+        block_type = cast(SSMBlockType, self.config.block_type)
 
         return DefaultHumanoidSSMModel(
             key,
@@ -659,16 +699,16 @@ if __name__ == "__main__":
     HumanoidWalkingSSMTask.launch(
         HumanoidWalkingSSMTaskConfig(
             # Model parameters.
-            hidden_size=212,
+            hidden_size=128,
             depth=5,
-            block_type="full_rank",
+            block_type="discrete_diagonal",
             discretize=False,
             # Training parameters.
             num_envs=2048,
             batch_size=256,
             num_passes=4,
             epochs_per_log_step=1,
-            rollout_length_seconds=10.0,
+            rollout_length_seconds=5.0,
             # Simulation parameters.
             dt=0.005,
             ctrl_dt=0.02,
