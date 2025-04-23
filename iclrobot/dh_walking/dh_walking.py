@@ -152,6 +152,12 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="Whether to visualize the reference motion after running IK.",
     )
 
+    # Actuator parameters.
+    actuator_bias_range: tuple[float, float] = xax.field(
+        value=(-0.2, 0.2),
+        help="The range of the actuator bias.",
+    )
+
     # Engine parameters.
     min_action_latency: float = xax.field(
         value=0.0,
@@ -343,7 +349,7 @@ class HumanoidWalkingTask(ksim.PPOTask[Config], Generic[Config]):
         """Creates actuators for controlling the robot's joints."""
         assert metadata is not None, "Metadata is required"
         return BiasedPositionActuators(
-            bias_range=(-0.1, 0.1) if self.config.randomize else (0.0, 0.0),
+            bias_range=self.config.actuator_bias_range if self.config.randomize else (0.0, 0.0),
             physics_model=physics_model,
             joint_name_to_metadata=metadata,
         )
